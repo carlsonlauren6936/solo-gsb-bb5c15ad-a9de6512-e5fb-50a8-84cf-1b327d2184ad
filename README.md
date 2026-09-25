@@ -19,6 +19,7 @@ docker compose up --build
 
 - API 地址与端口：`http://localhost:8000`
 - 匿名化接口：`POST http://localhost:8000/api/v1/anonymize`
+- 两次发布交集审计接口：`POST http://localhost:8000/api/v1/audit-intersection`
 - 健康检查：`GET http://localhost:8000/api/v1/health`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -160,6 +161,95 @@ curl -s http://localhost:8000/api/v1/anonymize \
   --data @examples/request.json
 ```
 
+## 两次发布交集审计
+
+`POST /api/v1/audit-intersection` 用于审计**同一批观测记录两次公开发布**后的
+关联风险：分别按两批记录各自的公开字段值形成等价组，再按共同的 id 求两次分组
+的**交集**。**即使两批各自的所有等价组都达到 k**，交集组仍可能不足 k，需要
+单独报险。
+
+请求体（完整文件见 `examples/request-audit-intersection.json`）：
+
+```json
+{
+  "k": 2,
+  "id_field": "id",
+  "records_a": [
+    {"id": "obs-001", "species": "哺乳动物", "reserve": "神农架"},
+    {"id": "obs-002", "species": "哺乳动物", "reserve": "神农架"},
+    {"id": "obs-003", "species": "哺乳动物", "reserve": "卧龙"},
+    {"id": "obs-004", "species": "哺乳动物", "reserve": "卧龙"},
+    {"id": "obs-005", "species": "哺乳动物", "reserve": "神农架"},
+    {"id": "obs-006", "species": "哺乳动物", "reserve": "卧龙"}
+  ],
+  "fields_a": ["species", "reserve"],
+  "records_b": [
+    {"id": "obs-001", "observer": "志愿者X"},
+    {"id": "obs-002", "observer": "志愿者X"},
+    {"id": "obs-003", "observer": "志愿者X"},
+    {"id": "obs-004", "observer": "志愿者Y"},
+    {"id": "obs-005", "observer": "志愿者Y"},
+    {"id": "obs-006", "observer": "志愿者Y"}
+  ],
+  "fields_b": ["observer"]
+}
+```
+
+字段说明：
+
+- `k`：正整数，交集成员数低于该值即标记为风险；
+- `id_field`：两批记录共有的 id 字段名，必须是非空字符串；
+- `records_a` / `records_b`：第一批、第二批**已发布**记录；每条记录的 id
+  必须是**非空字符串**且在**本批内唯一**，两批的 **id 集合必须完全相同**
+  （顺序可以不同）；每批至少 1 条；
+- `fields_a` / `fields_b`：第一批、第二批用于分组的公开字段名列表；
+  字段名必须非空，且对应字段在该批**每条记录中都必须存在且值为字符串**；
+  列表允许为空（此时该批全部记录归入同一组）。
+
+```bash
+curl -s http://localhost:8000/api/v1/audit-intersection \
+  -H 'Content-Type: application/json' \
+  --data @examples/request-audit-intersection.json
+```
+
+响应中每个交集包含 id 列表、成员数、两侧字段组合，以及 `count < k` 的风险
+标记；交集按其成员在**第一批记录中首次出现的顺序**排列（上例中第一批每组
+3 条、第二批每组 3 条，均达到 `k=2`，但 4 个交集里有 2 个仅 1 条，仍会被
+标记为 `at_risk: true`）：
+
+```json
+{
+  "intersections": [
+    {
+      "ids": ["obs-001", "obs-002"],
+      "count": 2,
+      "values_a": {"species": "哺乳动物", "reserve": "神农架"},
+      "values_b": {"observer": "志愿者X"},
+      "at_risk": false
+    },
+    {
+      "ids": ["obs-003"],
+      "count": 1,
+      "values_a": {"species": "哺乳动物", "reserve": "卧龙"},
+      "values_b": {"observer": "志愿者X"},
+      "at_risk": true
+    }
+  ],
+  "k": 2,
+  "id_field": "id",
+  "total_ids": 6,
+  "intersection_count": 4,
+  "at_risk_count": 2
+}
+```
+
+- `intersections[].ids`：属于该交集的 id 列表，按第一批记录顺序排列；
+- `intersections[].count`：交集成员数（等于 `ids` 的长度）；
+- `intersections[].values_a` / `values_b`：第一批 / 第二批分组字段的字段值组合；
+- `intersections[].at_risk`：`count < k` 时为 `true`；
+- `total_ids`：审计的 id 总数（即第一批记录数）；
+- `intersection_count`：交集总数，`at_risk_count`：风险交集数。
+
 ## 422 校验错误
 
 以下情况返回 HTTP `422 Unprocessable Entity`（FastAPI 的请求体结构错误同样为
@@ -182,6 +272,20 @@ curl -s http://localhost:8000/api/v1/anonymize \
 
 注：未启用 l-多样性时，记录总数 `>= k` 即必然存在可行方案（所有字段选到
 统一通配符级后全部记录并入同一组）；启用 l-多样性后该保证不再成立。
+
+### `POST /api/v1/audit-intersection` 的 422 情形
+
+以下情况同样返回 HTTP `422 Unprocessable Entity`：
+
+- `k` 不是正整数（含 `0`、负数、布尔值）；
+- `id_field` 为空字符串；
+- 某批记录为空（少于 1 条）；
+- 某条记录的 id 缺失、为空（含纯空白）或不是字符串；
+- 同一批记录中 id 重复出现；
+- 两批记录的 id 集合不完全相同（任一批多出或缺少 id）；
+- `fields_a` / `fields_b` 中的分组字段名是空字符串；
+- 某条记录缺少分组字段，或分组字段值不是字符串；
+- 请求体缺少必填字段、字段类型错误或包含未声明的额外字段。
 
 ## 数据安全
 

@@ -499,6 +499,252 @@ def test_422_when_sensitive_value_not_non_empty_string():
         assert "非空字符串" in response.json()["detail"]
 
 
+# ---------------------------------------------------------------- 交集审计
+
+# 第一批按 (species, reserve) 分组：神农架组 {001,002,005}、卧龙组 {003,004,006}。
+AUDIT_RECORDS_A = [
+    {"id": "obs-001", "species": "哺乳动物", "reserve": "神农架"},
+    {"id": "obs-002", "species": "哺乳动物", "reserve": "神农架"},
+    {"id": "obs-003", "species": "哺乳动物", "reserve": "卧龙"},
+    {"id": "obs-004", "species": "哺乳动物", "reserve": "卧龙"},
+    {"id": "obs-005", "species": "哺乳动物", "reserve": "神农架"},
+    {"id": "obs-006", "species": "哺乳动物", "reserve": "卧龙"},
+]
+
+# 第二批按 observer 分组：志愿者X {001,002,003}、志愿者Y {004,005,006}。
+# 顺序故意打乱，结果顺序与 id 顺序必须仍以第一批为准。
+AUDIT_RECORDS_B = [
+    {"id": "obs-006", "observer": "志愿者Y"},
+    {"id": "obs-003", "observer": "志愿者X"},
+    {"id": "obs-001", "observer": "志愿者X"},
+    {"id": "obs-005", "observer": "志愿者Y"},
+    {"id": "obs-004", "observer": "志愿者Y"},
+    {"id": "obs-002", "observer": "志愿者X"},
+]
+
+
+def audit_payload(k: int = 2, **overrides) -> dict:
+    body = {
+        "k": k,
+        "id_field": "id",
+        "records_a": AUDIT_RECORDS_A,
+        "fields_a": ["species", "reserve"],
+        "records_b": AUDIT_RECORDS_B,
+        "fields_b": ["observer"],
+    }
+    body.update(overrides)
+    return body
+
+
+def test_audit_intersection_ordering_count_and_values():
+    response = client.post("/api/v1/audit-intersection", json=audit_payload(k=2))
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["k"] == 2
+    assert body["id_field"] == "id"
+    assert body["total_ids"] == 6
+    assert body["intersection_count"] == 4
+    assert body["at_risk_count"] == 2
+
+    # 两批各自所有组均为 3 条（>= k=2），但 4 个交集中 2 个仅 1 条。
+    expected = [
+        {
+            "ids": ["obs-001", "obs-002"],
+            "count": 2,
+            "values_a": {"species": "哺乳动物", "reserve": "神农架"},
+            "values_b": {"observer": "志愿者X"},
+            "at_risk": False,
+        },
+        {
+            "ids": ["obs-003"],
+            "count": 1,
+            "values_a": {"species": "哺乳动物", "reserve": "卧龙"},
+            "values_b": {"observer": "志愿者X"},
+            "at_risk": True,
+        },
+        {
+            "ids": ["obs-004", "obs-006"],
+            "count": 2,
+            "values_a": {"species": "哺乳动物", "reserve": "卧龙"},
+            "values_b": {"observer": "志愿者Y"},
+            "at_risk": False,
+        },
+        {
+            "ids": ["obs-005"],
+            "count": 1,
+            "values_a": {"species": "哺乳动物", "reserve": "神农架"},
+            "values_b": {"observer": "志愿者Y"},
+            "at_risk": True,
+        },
+    ]
+    assert body["intersections"] == expected
+
+
+def test_audit_intersection_k_one_flags_nothing():
+    response = client.post("/api/v1/audit-intersection", json=audit_payload(k=1))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["at_risk_count"] == 0
+    assert all(not item["at_risk"] for item in body["intersections"])
+    assert sum(item["count"] for item in body["intersections"]) == 6
+
+
+def test_audit_intersection_custom_id_field():
+    # 自定义 id 字段名 uid，第二批顺序打乱。
+    records_a = [
+        {"uid": "u1", "reserve": "神农架"},
+        {"uid": "u2", "reserve": "神农架"},
+        {"uid": "u3", "reserve": "卧龙"},
+        {"uid": "u4", "reserve": "卧龙"},
+    ]
+    records_b = [
+        {"uid": "u4", "province": "四川"},
+        {"uid": "u2", "province": "四川"},
+        {"uid": "u1", "province": "湖北"},
+        {"uid": "u3", "province": "湖北"},
+    ]
+    response = client.post(
+        "/api/v1/audit-intersection",
+        json={
+            "k": 2,
+            "id_field": "uid",
+            "records_a": records_a,
+            "fields_a": ["reserve"],
+            "records_b": records_b,
+            "fields_b": ["province"],
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    # 两批各自单组均为 2 条达到 k，但交叉后的 4 个交集各仅 1 条，仍须报险。
+    assert body["total_ids"] == 4
+    assert body["intersection_count"] == 4
+    assert body["at_risk_count"] == 4
+    # 顺序与字段组合均以第一批为准。
+    assert body["intersections"][0]["ids"] == ["u1"]
+    assert body["intersections"][0]["values_a"] == {"reserve": "神农架"}
+    assert body["intersections"][0]["values_b"] == {"province": "湖北"}
+    assert body["intersections"][1]["ids"] == ["u2"]
+    assert body["intersections"][2]["ids"] == ["u3"]
+    assert body["intersections"][3]["ids"] == ["u4"]
+
+
+def test_audit_intersection_empty_field_lists_group_all():
+    response = client.post(
+        "/api/v1/audit-intersection",
+        json=audit_payload(fields_a=[], fields_b=[]),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["intersections"] == [
+        {
+            "ids": ["obs-001", "obs-002", "obs-003", "obs-004", "obs-005", "obs-006"],
+            "count": 6,
+            "values_a": {},
+            "values_b": {},
+            "at_risk": False,
+        }
+    ]
+
+
+def test_422_audit_when_k_not_positive():
+    for bad_k in (0, -1, True, "2", 2.5):
+        response = client.post(
+            "/api/v1/audit-intersection", json=audit_payload(k=bad_k)
+        )
+        assert response.status_code == 422
+
+
+def test_422_audit_when_id_field_empty():
+    response = client.post(
+        "/api/v1/audit-intersection", json=audit_payload(id_field="   ")
+    )
+    assert response.status_code == 422
+    assert "id_field" in response.json()["detail"]
+
+
+def test_422_audit_when_id_missing_or_invalid():
+    bad_variants = []
+    missing = [dict(record) for record in AUDIT_RECORDS_A]
+    del missing[0]["id"]
+    bad_variants.append(missing)
+    for bad_id in ("", "  ", 123, None, ["obs-001"], {"id": "x"}):
+        records = [dict(record) for record in AUDIT_RECORDS_A]
+        records[0]["id"] = bad_id
+        bad_variants.append(records)
+
+    for records in bad_variants:
+        response = client.post(
+            "/api/v1/audit-intersection", json=audit_payload(records_a=records)
+        )
+        assert response.status_code == 422
+        assert "非空字符串" in response.json()["detail"]
+
+
+def test_422_audit_when_id_duplicated_within_batch():
+    records = [dict(record) for record in AUDIT_RECORDS_A]
+    records[-1]["id"] = "obs-001"
+    response = client.post(
+        "/api/v1/audit-intersection", json=audit_payload(records_a=records)
+    )
+    assert response.status_code == 422
+    assert "重复出现" in response.json()["detail"]
+
+
+def test_422_audit_when_id_sets_differ():
+    records_b = [dict(record) for record in AUDIT_RECORDS_B]
+    records_b[0]["id"] = "obs-999"
+    response = client.post(
+        "/api/v1/audit-intersection", json=audit_payload(records_b=records_b)
+    )
+    assert response.status_code == 422
+    assert "id 集合" in response.json()["detail"]
+
+
+def test_422_audit_when_grouping_field_missing():
+    records = [dict(record) for record in AUDIT_RECORDS_A]
+    del records[1]["reserve"]
+    response = client.post(
+        "/api/v1/audit-intersection", json=audit_payload(records_a=records)
+    )
+    assert response.status_code == 422
+    assert "必须存在且为字符串" in response.json()["detail"]
+
+
+def test_422_audit_when_grouping_field_not_string():
+    for bad_value in (123, None, ["神农架"], {"v": 1}):
+        records = [dict(record) for record in AUDIT_RECORDS_A]
+        records[1]["reserve"] = bad_value
+        response = client.post(
+            "/api/v1/audit-intersection", json=audit_payload(records_a=records)
+        )
+        assert response.status_code == 422
+        assert "必须存在且为字符串" in response.json()["detail"]
+
+
+def test_422_audit_when_group_field_name_empty():
+    response = client.post(
+        "/api/v1/audit-intersection", json=audit_payload(fields_a=["species", ""])
+    )
+    assert response.status_code == 422
+    assert "分组字段名" in response.json()["detail"]
+
+
+def test_422_audit_when_batch_empty():
+    response = client.post(
+        "/api/v1/audit-intersection", json=audit_payload(records_a=[])
+    )
+    assert response.status_code == 422
+
+
+def test_422_audit_on_extra_body_field():
+    response = client.post(
+        "/api/v1/audit-intersection", json=audit_payload(extra=1)
+    )
+    assert response.status_code == 422
+
+
 # ---------------------------------------------------------------- 持久化
 
 def test_no_records_written_to_disk(tmp_path, monkeypatch):

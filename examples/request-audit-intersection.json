@@ -1,0 +1,22 @@
+{
+  "k": 2,
+  "id_field": "id",
+  "records_a": [
+    {"id": "obs-001", "species": "哺乳动物", "reserve": "神农架"},
+    {"id": "obs-002", "species": "哺乳动物", "reserve": "神农架"},
+    {"id": "obs-003", "species": "哺乳动物", "reserve": "卧龙"},
+    {"id": "obs-004", "species": "哺乳动物", "reserve": "卧龙"},
+    {"id": "obs-005", "species": "哺乳动物", "reserve": "神农架"},
+    {"id": "obs-006", "species": "哺乳动物", "reserve": "卧龙"}
+  ],
+  "fields_a": ["species", "reserve"],
+  "records_b": [
+    {"id": "obs-001", "observer": "志愿者X"},
+    {"id": "obs-002", "observer": "志愿者X"},
+    {"id": "obs-003", "observer": "志愿者X"},
+    {"id": "obs-004", "observer": "志愿者Y"},
+    {"id": "obs-005", "observer": "志愿者Y"},
+    {"id": "obs-006", "observer": "志愿者Y"}
+  ],
+  "fields_b": ["observer"]
+}

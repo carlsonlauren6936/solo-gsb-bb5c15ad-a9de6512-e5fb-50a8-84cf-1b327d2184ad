@@ -17,6 +17,7 @@ from .anonymizer import (
     solve_levels,
     unprocessable,
 )
+from .audit import compute_intersections
 
 API_PREFIX = "/api/v1"
 
@@ -72,6 +73,45 @@ class AnonymizeResponse(BaseModel):
     total_records: int
 
 
+class AuditIntersectionRequest(BaseModel):
+    """两次公开发布的交集审计请求体。"""
+
+    # 拒绝 bool 冒充整数；k 必须为正整数。
+    k: StrictInt = Field(..., description="交集成员数低于该阈值即标记为风险")
+    id_field: str = Field(..., description="两批记录共有的 id 字段名（非空字符串）")
+    records_a: list[dict[str, Any]] = Field(
+        ..., description="第一批已发布记录（id 批内唯一）"
+    )
+    fields_a: list[str] = Field(..., description="第一批用于分组的公开字段列表")
+    records_b: list[dict[str, Any]] = Field(
+        ..., description="第二批已发布记录（id 批内唯一，id 集合与第一批相同）"
+    )
+    fields_b: list[str] = Field(..., description="第二批用于分组的公开字段列表")
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class Intersection(BaseModel):
+    """两次分组的一个交集：id 列表、成员数与两侧字段组合。"""
+
+    ids: list[str]
+    count: int
+    values_a: dict[str, str]
+    values_b: dict[str, str]
+    at_risk: bool
+
+
+class AuditIntersectionResponse(BaseModel):
+    """交集审计结果。"""
+
+    intersections: list[Intersection]
+    k: int
+    id_field: str
+    total_ids: int
+    intersection_count: int
+    at_risk_count: int
+
+
 @app.get("/")
 def root() -> dict[str, str]:
     """服务信息。"""
@@ -80,6 +120,7 @@ def root() -> dict[str, str]:
         "docs": "/docs",
         "health": f"{API_PREFIX}/health",
         "anonymize": f"{API_PREFIX}/anonymize",
+        "audit_intersection": f"{API_PREFIX}/audit-intersection",
     }
 
 
@@ -125,4 +166,40 @@ def anonymize(request: AnonymizeRequest) -> AnonymizeResponse:
         groups=[Group(**group) for group in groups],
         k=request.k,
         total_records=len(request.records),
+    )
+
+
+@app.post(
+    f"{API_PREFIX}/audit-intersection",
+    response_model=AuditIntersectionResponse,
+)
+def audit_intersection(
+    request: AuditIntersectionRequest,
+) -> AuditIntersectionResponse:
+    """审计同一批观测记录两次公开发布后的分组交集关联风险。
+
+    分别按两批公开字段值形成等价组，再按 id 求两次分组的交集；
+    交集成员数不足 k 即标记 at_risk=true，即使两批各自所有组都达到 k。
+    """
+    if request.k < 1:
+        raise unprocessable("k 必须是正整数（>= 1）")
+    if not request.id_field.strip():
+        raise unprocessable("id_field 不能为空字符串")
+
+    intersections = compute_intersections(
+        request.records_a,
+        request.fields_a,
+        request.records_b,
+        request.fields_b,
+        request.id_field,
+        request.k,
+    )
+
+    return AuditIntersectionResponse(
+        intersections=[Intersection(**intersection) for intersection in intersections],
+        k=request.k,
+        id_field=request.id_field,
+        total_ids=len(request.records_a),
+        intersection_count=len(intersections),
+        at_risk_count=sum(1 for intersection in intersections if intersection["at_risk"]),
     )
