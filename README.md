@@ -19,6 +19,7 @@ docker compose up --build
 
 - API 地址与端口：`http://localhost:8000`
 - 匿名化接口：`POST http://localhost:8000/api/v1/anonymize`
+- 两次发布关联风险审计接口：`POST http://localhost:8000/api/v1/audit-intersection`
 - 健康检查：`GET http://localhost:8000/api/v1/health`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -159,6 +160,111 @@ curl -s http://localhost:8000/api/v1/anonymize \
   -H 'Content-Type: application/json' \
   --data @examples/request.json
 ```
+
+## 两次发布的关联风险审计
+
+`POST /api/v1/audit-intersection`，`Content-Type: application/json`。
+
+同一批观测记录若以**不同的公开字段**发布过两次，即使每次发布单独都满足
+k-匿名，把两次发布按 id 交叉比对，等价组的**交集**仍可能不足 k 条，从而
+把个体重新识别出来。本接口对这种关联风险做事后审计：
+
+1. 分别按两批记录各自的公开字段值形成等价组（字段值组合相同的记录同组）；
+2. 按共同 id 求两次分组的交集；
+3. 返回每个非空交集的 id 列表、成员数、两侧字段值组合，以及
+   `count < k` 的风险标记 `at_risk`；交集按**第一批记录的首次出现顺序**
+   排列，交集内 id 同序。
+
+### 请求格式
+
+```json
+{
+  "id_field": "id",
+  "k": 2,
+  "records_a": [
+    {"id": "obs-001", "reserve": "神农架", "observer": "志愿者A"},
+    {"id": "obs-002", "reserve": "神农架", "observer": "志愿者B"},
+    {"id": "obs-003", "reserve": "卧龙",   "observer": "志愿者C"},
+    {"id": "obs-004", "reserve": "卧龙",   "observer": "志愿者D"}
+  ],
+  "fields_a": ["reserve"],
+  "records_b": [
+    {"id": "obs-001", "weather": "晴"},
+    {"id": "obs-002", "weather": "阴"},
+    {"id": "obs-003", "weather": "晴"},
+    {"id": "obs-004", "weather": "阴"}
+  ],
+  "fields_b": ["weather"]
+}
+```
+
+- `records_a` / `records_b`：两次已发布的记录（每条为 JSON 对象）。
+- `fields_a` / `fields_b`：两批各自用于分组的公开字段名列表；字段必须
+  在该批每条记录中存在且值为字符串（空字符串也是合法值）；字段名不能
+  为空或重复。列表可为空，空列表表示该批所有记录同属一个组。
+- `id_field`：两批共同的 id 字段名；id 必须是**非空字符串**且在**各批内
+  唯一**，并且两批的 id 集合必须**完全相同**。
+- `k`：正整数，交集成员数的风险阈值；`count < k` 即标记 `at_risk: true`。
+
+### 响应格式
+
+上例中两次发布各自的每个组都有 2 条（单独看满足 k=2），但 2×2 交叉后
+每个交集只有 1 条，因此 4 个交集全部报险——这正是仅检查单次发布
+无法发现的关联风险：
+
+```json
+{
+  "intersections": [
+    {"ids": ["obs-001"], "count": 1,
+     "values_a": {"reserve": "神农架"}, "values_b": {"weather": "晴"},
+     "at_risk": true},
+    {"ids": ["obs-002"], "count": 1,
+     "values_a": {"reserve": "神农架"}, "values_b": {"weather": "阴"},
+     "at_risk": true},
+    {"ids": ["obs-003"], "count": 1,
+     "values_a": {"reserve": "卧龙"}, "values_b": {"weather": "晴"},
+     "at_risk": true},
+    {"ids": ["obs-004"], "count": 1,
+     "values_a": {"reserve": "卧龙"}, "values_b": {"weather": "阴"},
+     "at_risk": true}
+  ],
+  "k": 2,
+  "total_records": 4,
+  "risk_count": 4
+}
+```
+
+- `intersections`：各交集单元，按第一批记录的首次出现顺序排列：
+  - `ids`：属于该交集的 id 列表（同按第一批出现顺序）；
+  - `count`：交集成员数；
+  - `values_a` / `values_b`：交集两侧各自的字段值组合（键即
+    `fields_a` / `fields_b`）；
+  - `at_risk`：`count < k` 时为 `true`。
+- `risk_count`：报险交集的数量；`k=1` 时恒为 0。
+
+注意：**即使两批各自的所有组都达到 k，交集不足 k 仍会报险**（如上例）。
+`k` 大于记录总数不是参数错误，此时所有交集都必然报险。
+
+仓库内 `examples/request-audit-intersection.json` 为可直接使用的示例：
+
+```bash
+curl -s http://localhost:8000/api/v1/audit-intersection \
+  -H 'Content-Type: application/json' \
+  --data @examples/request-audit-intersection.json
+```
+
+### 审计接口的 422 校验
+
+以下情况返回 HTTP `422 Unprocessable Entity`（请求体结构错误同样为
+422），错误说明在响应体 `detail` 中：
+
+- `k` 不是正整数（含 `0`、负数、布尔值、非整数）；
+- `id_field` 为空字符串；
+- 任一批记录为空，或某条记录缺少 id、id 不是非空字符串；
+- id 在批内不唯一，或两批 id 集合不一致（错误信息列出差异 id）；
+- 分组字段名为空或在同一列表中重复；
+- 某条记录缺少分组字段，或分组字段值不是字符串；
+- 请求体缺少必填字段或出现未声明字段。
 
 ## 422 校验错误
 
